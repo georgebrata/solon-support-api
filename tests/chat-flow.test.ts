@@ -116,7 +116,15 @@ describe("chat flow", () => {
     expect(body.quick_replies).toEqual([{ caption: "Alpha" }, { caption: "Beta" }]);
     expect(body.actions).toEqual([{ tag_name: "needs_human" }]);
     expect(wakeCalls).toHaveLength(1);
-    expect(Object.keys(wakeCalls[0] ?? {}).sort()).toEqual(["job_id", "message", "session_id"]);
+    expect(Object.keys(wakeCalls[0] ?? {}).sort()).toEqual([
+      "has_contact",
+      "history",
+      "job_id",
+      "message",
+      "session_id",
+    ]);
+    expect(wakeCalls[0]?.has_contact).toBe(true);
+    expect(wakeCalls[0]?.history).toEqual([]);
     expect(wakeCalls[0]?.message).toBe("Hello");
     expect(JSON.stringify(wakeCalls[0])).not.toContain(email);
     expect(seenHeaders[0]).toBe(formatAuthorization("test-webhook-key"));
@@ -264,10 +272,55 @@ describe("chat flow", () => {
         job_id: sessionId,
         session_id: sessionId,
         message: "Hello",
+        history: [],
+        has_contact: false,
       });
     } finally {
       globalThis.fetch = original;
     }
+  });
+
+  it("sends prior turns as history on the next wake", async () => {
+    const wakeCalls: WakePayload[] = [];
+    setWakeForTests({
+      async wake(payload) {
+        wakeCalls.push(payload);
+        await replyPost(
+          authorizedReply({
+            job_id: payload.job_id,
+            session_id: payload.session_id,
+            reply: { messages: [{ type: "text", text: "Answer" }], quick_replies: [], actions: [] },
+          }),
+        );
+        return { ok: true };
+      },
+    });
+    await chatPost(chatRequest(widgetBody));
+    await chatPost(chatRequest({ ...widgetBody, message: "Second" }));
+    expect(wakeCalls[1]?.message).toBe("Second");
+    expect(wakeCalls[1]?.history).toEqual([
+      { role: "user", text: "Hello" },
+      { role: "assistant", text: "Answer" },
+    ]);
+  });
+
+  it("rejects an oversized body even without content-length", async () => {
+    setWakeForTests({ async wake() { return { ok: true }; } });
+    const response = await chatPost(
+      chatRequest({ ...widgetBody, message: "x".repeat(40_000) }),
+    );
+    expect(response.status).toBe(400);
+  });
+
+  it("rejects an oversized internal reply body", async () => {
+    const response = await replyPost(
+      authorizedReply({
+        job_id: sessionId,
+        session_id: sessionId,
+        reply: { messages: [{ type: "text", text: "x".repeat(40_000) }], quick_replies: [], actions: [] },
+      }),
+    );
+    expect(response.status).toBe(400);
   });
 
   it("rejects a reply whose session does not match the job", async () => {
