@@ -2,12 +2,14 @@ import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
 import { CHAT_POLL_INTERVAL_MS, CHAT_WAIT_BUDGET_MS } from "../src/lib/chat-service";
 import {
+  ACTION_TAGS,
   chatRequestSchema,
   normalizeReply,
   publicChatResponseSchema,
 } from "../src/lib/contract";
 import { kvValueToString } from "../src/lib/kv";
-import { wakeBodyKeys } from "../src/lib/wake";
+import { clientAddress } from "../src/lib/rate-limit";
+import { minimalWakeBody, wakeBodyKeys, WAKE_HISTORY_LIMIT } from "../src/lib/wake";
 import { WEBSITE_SUPPORT_SOURCE, type ProspectHandoff } from "../src/lib/trello-types";
 
 const sessionId = "00000000-0000-4000-8000-000000000001";
@@ -95,8 +97,42 @@ describe("bridge invariants", () => {
     expect(CHAT_POLL_INTERVAL_MS).toBeLessThanOrEqual(1000);
   });
 
-  it("wakes the bot with only job_id, session_id, and message", () => {
-    expect([...wakeBodyKeys()].sort()).toEqual(["job_id", "message", "session_id"]);
+  it("wakes the bot with job_id, session, message, capped history, contact flag only", () => {
+    expect([...wakeBodyKeys()].sort()).toEqual([
+      "has_contact",
+      "history",
+      "job_id",
+      "message",
+      "session_id",
+    ]);
+    const body = minimalWakeBody({
+      job_id: "00000000-0000-4000-8000-000000000001",
+      session_id: "00000000-0000-4000-8000-000000000002",
+      message: "salut",
+      history: Array.from({ length: 30 }, (_, i) => ({
+        role: i % 2 === 0 ? ("user" as const) : ("assistant" as const),
+        text: "x".repeat(2000),
+      })),
+    });
+    expect(body.history).toHaveLength(WAKE_HISTORY_LIMIT);
+    expect(body.history?.every((item) => item.text.length <= 1000)).toBe(true);
+    expect(body).not.toHaveProperty("email");
+    expect(body.has_contact).toBe(false);
+  });
+
+  it("keeps resolved as an explicit action tag and drops it when escalating", () => {
+    const resolved = normalizeReply({
+      messages: [{ type: "text", text: "Gata!" }],
+      quick_replies: [],
+      actions: [{ tag_name: "resolved" }, { tag_name: "resolved" }],
+    });
+    expect(resolved.actions).toEqual([{ tag_name: ACTION_TAGS.resolved }]);
+    const escalated = normalizeReply({
+      messages: [{ type: "text", text: "Te conectez cu un coleg." }],
+      quick_replies: [],
+      actions: [{ tag_name: "resolved" }, { tag_name: "needs_human" }],
+    });
+    expect(escalated.actions).toEqual([{ tag_name: ACTION_TAGS.needsHuman }]);
   });
 
   it("does not use an in-memory map in the production kv module", () => {
@@ -163,5 +199,33 @@ describe("bridge invariants", () => {
     expect(vercel.regions).toEqual(["fra1"]);
     expect(vercel.functionFailoverRegions).toBeUndefined();
     expect(vercel.functions?.["src/app/api/chat/route.ts"]?.maxDuration).toBe(60);
+  });
+});
+
+describe("client address for rate limiting", () => {
+  const req = (headers: Record<string, string>) =>
+    new Request("https://example.test/api/chat", { headers });
+
+  it("prefers the platform x-real-ip over spoofable x-forwarded-for", () => {
+    expect(clientAddress(req({ "x-real-ip": "198.51.100.7", "x-forwarded-for": "1.2.3.4" }))).toBe(
+      "198.51.100.7",
+    );
+  });
+
+  it("uses the rightmost x-forwarded-for entry, never the leftmost", () => {
+    expect(clientAddress(req({ "x-forwarded-for": "1.2.3.4, 203.0.113.10" }))).toBe("203.0.113.10");
+  });
+
+  it("prefers x-vercel-forwarded-for when present", () => {
+    expect(
+      clientAddress(
+        req({ "x-vercel-forwarded-for": "192.0.2.5", "x-real-ip": "198.51.100.7", "x-forwarded-for": "1.2.3.4" }),
+      ),
+    ).toBe("192.0.2.5");
+  });
+
+  it("falls back to unknown", () => {
+    expect(clientAddress(req({}))).toBe("unknown");
+    expect(clientAddress(req({ "x-real-ip": "bad value!" }))).toBe("unknown");
   });
 });

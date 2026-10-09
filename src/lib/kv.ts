@@ -16,6 +16,13 @@ export interface KvStore {
   incr(key: string): Promise<number>;
   expire(key: string, seconds: number): Promise<void>;
   del(key: string): Promise<void>;
+  /**
+   * Atomically append to a list, keep only the last maxLen items and refresh
+   * the TTL (single MULTI/EXEC transaction on Upstash).
+   */
+  appendList(key: string, value: string, options: { maxLen: number; ex: number }): Promise<void>;
+  /** Return the last `count` items of a list (oldest first). */
+  readListTail(key: string, count: number): Promise<string[]>;
 }
 
 export const kvValueToString = (value: unknown): string | null => {
@@ -74,6 +81,19 @@ const createUpstashStore = (): KvStore => {
     },
     async del(key) {
       await redis.del(key);
+    },
+    async appendList(key, value, options) {
+      const tx = redis.multi();
+      tx.rpush(key, value);
+      tx.ltrim(key, -options.maxLen, -1);
+      tx.expire(key, options.ex);
+      await tx.exec();
+    },
+    async readListTail(key, count) {
+      const values: unknown[] = await redis.lrange(key, -count, -1);
+      return values
+        .map((value) => kvValueToString(value))
+        .filter((value): value is string => value !== null);
     },
   };
 };

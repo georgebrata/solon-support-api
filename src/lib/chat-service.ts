@@ -7,16 +7,29 @@ import {
   type PublicChatResponse,
 } from "./contract";
 import { resolveCors } from "./cors";
-import { json } from "./http";
-import { createPendingJob, readJob } from "./jobs";
+import { json, readJsonBody } from "./http";
+import { createPendingJob, readHistory, readJob } from "./jobs";
 import { getKv } from "./kv";
 import { allowChat, clientAddress } from "./rate-limit";
-import { getWakeClient } from "./wake";
+import { getWakeClient, WAKE_HISTORY_LIMIT, type WakeHistoryItem } from "./wake";
+import type { HistoryEntry } from "./contract";
+
+const historyForWake = (entries: HistoryEntry[]): WakeHistoryItem[] => {
+  const items: WakeHistoryItem[] = [];
+  for (const entry of entries.slice(-WAKE_HISTORY_LIMIT)) {
+    if (entry.role === "user" && entry.message) {
+      items.push({ role: "user", text: entry.message });
+    } else if (entry.role === "assistant" && entry.reply) {
+      const text = entry.reply.messages.map((message) => message.text).join("\n\n");
+      if (text) items.push({ role: "assistant", text });
+    }
+  }
+  return items;
+};
 
 export const CHAT_POLL_INTERVAL_MS = 400;
 export const CHAT_WAIT_BUDGET_MS = 55_000;
 const WAKE_TIMEOUT_CAP_MS = 10_000;
-const MAX_BODY_BYTES = 32_000;
 
 type ChatTiming = {
   pollIntervalMs: number;
@@ -96,14 +109,9 @@ export const handleChat = async (request: Request): Promise<Response> => {
     return json({ error: "origin_not_allowed" }, 403);
   }
 
-  const lengthHeader = request.headers.get("content-length");
-  if (lengthHeader && Number(lengthHeader) > MAX_BODY_BYTES) {
-    return json({ error: "bad_request" }, 400, cors.headers);
-  }
-
   let payload: unknown;
   try {
-    payload = await request.json();
+    payload = await readJsonBody(request);
   } catch {
     return json({ error: "bad_request" }, 400, cors.headers);
   }
@@ -135,6 +143,7 @@ export const handleChat = async (request: Request): Promise<Response> => {
 
     const timing = resolveTiming();
     const deadline = Date.now() + timing.timeoutMs;
+    const priorHistory = await readHistory(kv, parsed.data.session_id);
     const job = await createPendingJob(kv, parsed.data);
     const wakeBudget = Math.min(WAKE_TIMEOUT_CAP_MS, Math.max(1, deadline - Date.now()));
     const wakeResult = await wake.wake(
@@ -142,6 +151,8 @@ export const handleChat = async (request: Request): Promise<Response> => {
         job_id: job.job_id,
         session_id: job.session_id,
         message: job.message,
+        history: historyForWake(priorHistory),
+        has_contact: Boolean(job.email || job.name),
       },
       { timeoutMs: wakeBudget },
     );

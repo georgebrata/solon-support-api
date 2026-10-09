@@ -1,9 +1,19 @@
 import type { KvStore } from "./kv";
 
+/**
+ * Client address for rate limiting. Vercel sets x-vercel-forwarded-for and
+ * x-real-ip itself (clients cannot override them), so they are preferred. The leftmost x-forwarded-for entry is client-controlled and must
+ * never be trusted; if x-real-ip is missing we use the rightmost entry, which
+ * is the one appended by the closest trusted proxy.
+ */
 export const clientAddress = (request: Request): string => {
-  const forwarded = request.headers.get("x-forwarded-for");
-  const candidate =
-    forwarded?.split(",")[0]?.trim() || request.headers.get("x-real-ip")?.trim() || "unknown";
+  const vercelForwarded = request.headers.get("x-vercel-forwarded-for")?.split(",")[0]?.trim();
+  const realIp = vercelForwarded || request.headers.get("x-real-ip")?.trim();
+  const forwardedParts = (request.headers.get("x-forwarded-for") ?? "")
+    .split(",")
+    .map((part) => part.trim())
+    .filter((part) => part.length > 0);
+  const candidate = realIp || forwardedParts[forwardedParts.length - 1] || "unknown";
   if (!/^[A-Za-z0-9:.\-]{1,64}$/.test(candidate)) return "unknown";
   return candidate;
 };

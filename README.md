@@ -6,7 +6,7 @@ This repository is public. Do not commit secrets, webhook URLs, tokens, real ema
 
 ## Setup
 
-Requires Node.js 20 or newer.
+Requires Node.js 20.9.0 or newer (Next.js 16 minimum).
 
 ```bash
 npm ci
@@ -30,11 +30,13 @@ Smoke test against a running server. By default it only calls `/api/health`. The
 
 ```bash
 npm run smoke
-npm run smoke -- http://127.0.0.1:3000
-npm run smoke -- http://127.0.0.1:3000 --chat
+npm run smoke -- https://solon-support-api.vercel.app
+npm run smoke -- https://solon-support-api.vercel.app --chat
+npm run smoke -- https://solon-support-api.vercel.app --chat --message "Hello, what do you offer?" --origin https://solon.agency
+npm run smoke -- http://127.0.0.1:3000 --chat --allow-unconfigured
 ```
 
-`--chat` also POSTs `/api/chat` and may wait for the sync reply. Leave it off unless you intend to create a job.
+`--chat` also POSTs `/api/chat` (this wakes the real Support Bot) and prints only status, latency, message count, and action tags, never text. It fails on non-200, an empty reply, or `needs_human` (bot did not answer). A 503 `not_configured` passes only with `--allow-unconfigured`.
 
 ## Env
 
@@ -70,13 +72,27 @@ Success and the timeout fallback are both HTTP 200 so the widget can render them
 }
 ```
 
-The live widget reads `messages[]`, `quick_replies[]`, and `actions[]`. It renders a quick reply only when the entry has `caption`, and it treats `actions[].tag_name === "needs_human"` as a handoff. The internal reply accepts caption objects or plain strings and stores the caption form.
+The live widget reads `messages[]`, `quick_replies[]`, and `actions[]`. It renders a quick reply only when the entry has `caption`. Action tags: `needs_human` (handoff note, GA4 `support_chat_escalated`) and `resolved` (question answered, GA4 `support_chat_resolved`); unknown tags are ignored, so the contract stays n8n-compatible. The internal reply accepts caption objects or plain strings and stores the caption form.
 
 Other chat statuses: `400 bad_request`, `403 origin_not_allowed`, `429 rate_limited`, `503 not_configured`, `500 internal_error`.
 
 `POST /api/internal/reply` and `GET /api/internal/job?job_id=` use `Authorization` with the Bearer scheme and `INTERNAL_API_SECRET`. Comparison is a SHA-256 timing-safe compare. See `AGENT.md` for the body.
 
 The chat route exports `maxDuration = 60`. The wait budget is 55 seconds, including the wake call, so the handler returns before the platform limit and before the widget's 60 second abort.
+
+## Architecture
+
+```
+solon.agency widget (assets/js/support-chat.js, Maria UI, GA4 events)
+  -> POST https://solon-support-api.vercel.app/api/chat
+       validate, CORS, rate limit, job -> Upstash Redis (24h TTL)
+       wake -> Support Bot webhook routine (GROK_SUPPORT_WEBHOOK_URL + bearer)
+       poll Redis up to 55s
+  <- n8n-compatible JSON
+Support Bot ("Maria") -> POST /api/internal/reply (Bearer INTERNAL_API_SECRET)
+```
+
+The browser never calls the bot webhook. CRM (Trello SOLON People) writes happen on the Support Bot side, not here. Bot rules and invariants: `AGENT.md`.
 
 ## Deploy
 
@@ -92,8 +108,8 @@ Production job state is Upstash Redis behind `src/lib/kv.ts`. There is no in-mem
 
 ## Rollback
 
-1. Point the website widget back at the previous chat provider and restore that host in the site `connect-src` policy.
-2. Keep the previous provider available for 14 days.
+1. Point the website widget back at the previous chat provider (n8n webhook `https://solon-agency.app.n8n.cloud/webhook/customer-support-agent`) and restore that host in the site `connect-src` policy, via a solon-landing PR.
+2. George keeps the n8n workflow available (paused, not deleted) for 14 days after cutover and unpauses it on rollback. Bots have no n8n access.
 3. Leave this project deployed so `/api/health` can still be checked.
 4. Do not copy environment values into the repository while rolling back.
 

@@ -7,13 +7,13 @@ import {
   type StoredJob,
 } from "./contract";
 import type { KvStore } from "./kv";
-import { z } from "zod";
 
-const JOB_TTL_SECONDS = 24 * 60 * 60;
-const HISTORY_LIMIT = 40;
+/** Job and transcript TTL (Phase 4 hardening): 24 hours, refreshed on each append. */
+export const JOB_TTL_SECONDS = 24 * 60 * 60;
+export const HISTORY_LIMIT = 40;
 
 const jobKey = (jobId: string): string => `job:${jobId}`;
-const historyKey = (sessionId: string): string => `session:${sessionId}:history`;
+const historyKey = (sessionId: string): string => `session:${sessionId}:hist`;
 
 const parseJson = (raw: string): unknown => {
   return JSON.parse(raw) as unknown;
@@ -32,16 +32,17 @@ export const readJob = async (kv: KvStore, jobId: string): Promise<StoredJob | n
 };
 
 export const readHistory = async (kv: KvStore, sessionId: string): Promise<HistoryEntry[]> => {
-  const raw = await kv.get(historyKey(sessionId));
-  if (!raw) return [];
-  try {
-    const result = z.array(historyEntrySchema).safeParse(parseJson(raw));
-    if (!result.success) return [];
-    return result.data.slice(-HISTORY_LIMIT);
-  } catch {
-    console.error(JSON.stringify({ event: "history_corrupt" }));
-    return [];
+  const raw = await kv.readListTail(historyKey(sessionId), HISTORY_LIMIT);
+  const entries: HistoryEntry[] = [];
+  for (const item of raw) {
+    try {
+      const result = historyEntrySchema.safeParse(parseJson(item));
+      if (result.success) entries.push(result.data);
+    } catch {
+      console.error(JSON.stringify({ event: "history_corrupt" }));
+    }
   }
+  return entries;
 };
 
 const saveJob = async (kv: KvStore, job: StoredJob): Promise<void> => {
@@ -49,11 +50,16 @@ const saveJob = async (kv: KvStore, job: StoredJob): Promise<void> => {
   await kv.set(jobKey(checked.job_id), JSON.stringify(checked), { ex: JOB_TTL_SECONDS });
 };
 
+/**
+ * Appends with RPUSH + LTRIM + EXPIRE in one transaction so concurrent
+ * messages in the same session cannot overwrite each other.
+ */
 const appendHistory = async (kv: KvStore, sessionId: string, entry: HistoryEntry): Promise<void> => {
   const checked = historyEntrySchema.parse(entry);
-  const current = await readHistory(kv, sessionId);
-  const next = [...current, checked].slice(-HISTORY_LIMIT);
-  await kv.set(historyKey(sessionId), JSON.stringify(next), { ex: JOB_TTL_SECONDS });
+  await kv.appendList(historyKey(sessionId), JSON.stringify(checked), {
+    maxLen: HISTORY_LIMIT,
+    ex: JOB_TTL_SECONDS,
+  });
 };
 
 export const createPendingJob = async (kv: KvStore, input: ChatRequest): Promise<StoredJob> => {

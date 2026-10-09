@@ -29,6 +29,18 @@ export const textMessageSchema = z
   })
   .strict();
 
+/**
+ * Action tags understood by the website widget. Unknown tags are ignored by the
+ * widget (n8n-compatible), so new tags are additive.
+ * - needs_human: the widget shows the human handoff note (GA4 support_chat_escalated).
+ * - resolved: Maria considers the visitor's question answered (GA4 support_chat_resolved).
+ * Never send both in the same reply; needs_human wins.
+ */
+export const ACTION_TAGS = {
+  needsHuman: "needs_human",
+  resolved: "resolved",
+} as const;
+
 export const actionSchema = z
   .object({
     tag_name: z
@@ -167,12 +179,20 @@ export const WAKE_FAILED_REPLY: PublicChatResponse = {
 };
 
 export const normalizeReply = (reply: InboundReplyBody): PublicChatResponse => {
+  const escalated = reply.actions.some((action) => action.tag_name === ACTION_TAGS.needsHuman);
+  const seen = new Set<string>();
+  const actions = reply.actions.filter((action) => {
+    if (escalated && action.tag_name === ACTION_TAGS.resolved) return false;
+    if (seen.has(action.tag_name)) return false;
+    seen.add(action.tag_name);
+    return true;
+  });
   const normalized = {
     messages: reply.messages,
     quick_replies: reply.quick_replies.map((item) =>
       typeof item === "string" ? { caption: item } : { caption: item.caption },
     ),
-    actions: reply.actions,
+    actions,
   };
   return publicChatResponseSchema.parse(normalized);
 };

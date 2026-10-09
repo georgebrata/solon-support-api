@@ -5,7 +5,7 @@ import {
   NOT_CONFIGURED_BODY,
   normalizeReply,
 } from "./contract";
-import { json } from "./http";
+import { json, readJsonBody } from "./http";
 import { completeJob, readHistory, readJob } from "./jobs";
 import { getKv } from "./kv";
 import { z } from "zod";
@@ -32,7 +32,7 @@ export const handleReply = async (request: Request): Promise<Response> => {
 
   let payload: unknown;
   try {
-    payload = await request.json();
+    payload = await readJsonBody(request);
   } catch {
     return json({ error: "bad_request" }, 400);
   }
